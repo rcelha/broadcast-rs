@@ -1,0 +1,19 @@
+[package]
+name = "broadcast-rs"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["test"]
+test = []
+
+[dependencies]
+anyhow = "1.0.79"
+axum = { version = "0.7.4", features = ["ws"] }
+futures = { version = "0.3.30" }
+redis = { version = "0.24.0", features = ["tokio-comp"] }
+tokio = { version = "1.36.0", features = ["full"] }
+tower = { version = "0.4.13", features = ["full"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.21.0"
