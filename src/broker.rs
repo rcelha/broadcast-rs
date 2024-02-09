@@ -5,7 +5,10 @@ use futures::StreamExt;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::admin_commands::{AdminCommand, AdminCommands};
+
 type CHashMap<K, V> = Arc<RwLock<HashMap<K, V>>>;
+static LOCK_POISONED_ERROR: &str = "Lock poisoned: This is an unrecoverable error";
 
 #[derive(Debug)]
 pub enum BrokerMessage {
@@ -45,7 +48,7 @@ impl RedisBrokerConfig {
     }
 
     pub fn build(self) -> Result<RedisBroker> {
-        RedisBroker::from_config(self)
+        self.try_into()
     }
 }
 
@@ -53,13 +56,14 @@ impl RedisBrokerConfig {
 ///
 /// The flow of the broker is (simplified) as follows:
 /// 1. The broker starts and connects to redis.
-/// 2. The broker listens for messages on the "global" channel with [[RedisBroker::serve_broker]]
+/// 2. The broker listens for messages on the "global"
 /// 3. Clients connect to the broker. The broker creates a new channel for each client.
 /// 4. Clients subscribe to the broker's channel by sending a message to the broker. The broker
 ///   listens for these messages and adds to its internal list of subscriptions.
 /// 5. When the broker receives a message, it routes to the appropriate client's channel.
 ///
 /// TODO: Make it generic over message type
+/// TODO: Add diagram
 pub struct RedisBroker {
     pub redis_client: redis::Client,
     pub channel_capacity: usize,
@@ -78,19 +82,26 @@ pub struct RedisBroker {
     pub api_rx: mpsc::UnboundedReceiver<BrokerMessage>,
 }
 
-impl RedisBroker {
-    /// Create a new RedisBroker with default configuration
-    ///
-    /// ```ignore
-    /// # use broadcast_rs::broker::RedisBroker;
-    /// let broker = RedisBroker::config().build()?;
-    /// ```
-    pub fn config() -> RedisBrokerConfig {
-        RedisBrokerConfig::default()
-    }
+/// Convert a RedisBrokerConfig into a RedisBroker
+///
+/// # Example
+/// ```rust
+/// # use broadcast_rs::broker::{RedisBroker, RedisBrokerConfig};
+/// # use anyhow::Result;
+/// # async fn run() -> Result<()> {
+///    let mut broker_config = RedisBrokerConfig::new();
+///    broker_config.redis_url = "redis://localhost:6666/".to_string();
+///    broker_config.channel_capacity = 100;
+///    let broker = RedisBroker::try_from(broker_config.clone())?;
+///    // or
+///    let broker: RedisBroker = broker_config.try_into()?;
+///    # Ok(())
+/// # }
+/// ```
+impl TryFrom<RedisBrokerConfig> for RedisBroker {
+    type Error = anyhow::Error;
 
-    // TODO move it to `impl From` trait
-    pub fn from_config(config: RedisBrokerConfig) -> Result<Self> {
+    fn try_from(config: RedisBrokerConfig) -> std::prelude::v1::Result<Self, Self::Error> {
         let (api_tx, api_rx) = mpsc::unbounded_channel();
         let redis_client = redis::Client::open(config.redis_url.as_str())?;
 
@@ -105,13 +116,26 @@ impl RedisBroker {
         };
         Ok(new_self)
     }
+}
+
+impl RedisBroker {
+    /// Create a new RedisBroker with default configuration
+    ///
+    /// ```ignore
+    /// # use broadcast_rs::broker::RedisBroker;
+    /// let broker = RedisBroker::config().build()?;
+    /// ```
+    pub fn config() -> RedisBrokerConfig {
+        RedisBrokerConfig::default()
+    }
 
     /// Create a new API object for this broker
     pub fn api(&self) -> BrokerApi {
         BrokerApi::new(self.api_tx.clone())
     }
 
-    async fn handle_connect_client(
+    /// Handles `BokerMessage::ConnectClient` messages
+    fn handle_connect_client(
         &self,
         client_id: String,
         tx: oneshot::Sender<broadcast::Sender<String>>,
@@ -119,22 +143,43 @@ impl RedisBroker {
         let (broadcast_tx, _) = broadcast::channel(self.channel_capacity);
         self.senders
             .write()
-            .unwrap()
+            .expect(LOCK_POISONED_ERROR)
             .insert(client_id, broadcast_tx.clone());
         tx.send(broadcast_tx).expect("TODO");
         Ok(())
     }
 
-    async fn handle_disconnect_client(&self, client_id: String) -> Result<()> {
-        let mut client_subscriptions = self.client_subscriptions.write().unwrap();
-        for i in client_subscriptions.values_mut() {
+    /// Handles `BokerMessage::DisconnectClient` messages
+    fn handle_disconnect_client(&self, client_id: String) -> Result<()> {
+        Self::disconnect_client(
+            self.client_subscriptions.clone(),
+            self.senders.clone(),
+            client_id,
+        )
+    }
+
+    fn disconnect_client(
+        client_subscriptions: CHashMap<String, HashSet<String>>,
+        senders: CHashMap<String, broadcast::Sender<String>>,
+        client_id: String,
+    ) -> Result<()> {
+        let mut client_subscriptions_guard =
+            client_subscriptions.write().expect(LOCK_POISONED_ERROR);
+
+        for i in client_subscriptions_guard.values_mut() {
             i.remove(&client_id);
         }
-        let client_tx = self.senders.write().unwrap().remove(&client_id);
+        let client_tx = senders
+            .write()
+            .expect(LOCK_POISONED_ERROR)
+            .remove(&client_id);
+
         client_tx.and_then(|tx| tx.send("#DISCONNECTED#".to_string()).ok()); // TODO handle on the other side
+
         Ok(())
     }
 
+    /// Handles [BokerMessage::Subscribe] messages
     async fn handle_subscribe(&self, client_id: String, channel: String) -> Result<()> {
         let conn = self.redis_client.get_tokio_connection().await?;
 
@@ -147,7 +192,7 @@ impl RedisBroker {
         client_subscriptions
             .clone()
             .write()
-            .unwrap()
+            .expect(LOCK_POISONED_ERROR)
             .entry(channel.clone())
             .or_insert(HashSet::new())
             .insert(client_id.clone());
@@ -155,7 +200,7 @@ impl RedisBroker {
         if let Some(_) = self
             .subscription_join_handlers
             .read()
-            .unwrap()
+            .expect(LOCK_POISONED_ERROR)
             .get(&channel)
         {
             return Ok(());
@@ -164,6 +209,7 @@ impl RedisBroker {
         let inner_client_subscriptions = client_subscriptions.clone();
         let inner_senders = senders.clone();
         let inner_channel = channel.clone();
+        let inner_subscription_join_handlers = self.subscription_join_handlers.clone();
 
         let subscription_join_handler = tokio::spawn(async move {
             // TODO handle error
@@ -174,57 +220,95 @@ impl RedisBroker {
                     let payload: String = msg.get_payload()?;
                     for client_id in inner_client_subscriptions
                         .read()
-                        .unwrap()
+                        .expect(LOCK_POISONED_ERROR)
                         .get(&inner_channel)
                         .unwrap_or(&HashSet::new())
                     {
-                        if let Some(sender) = inner_senders.read().unwrap().get(client_id) {
+                        if let Some(sender) = inner_senders
+                            .read()
+                            .expect(LOCK_POISONED_ERROR)
+                            .get(client_id)
+                        {
                             // TODO Stop cloning the payload
                             // TODO maybe I can use `Cow<'static, &str>` instead
-                            sender.send(payload.clone()).unwrap();
+                            let send_result = sender.send(payload.clone());
+
+                            // Receiver cannot receive messages at the moment
+                            // For now, we will assume the client is disconnected
+                            // and we will remove it from the list of subscribers
+                            //
+                            // In the future, we should have a way to wait for its
+                            // reconnection
+                            if send_result.is_err() {
+                                Self::disconnect_client(
+                                    inner_client_subscriptions.clone(),
+                                    inner_senders.clone(),
+                                    client_id.clone(),
+                                )?;
+                            }
+                        } else {
+                            // A client we thought was a subscriber doesn't have
+                            // a internal channel to receive messages
+                            // As there is no way to communicate to the client
+                            // we need to assume the client is disconnected
+                            Self::disconnect_client(
+                                inner_client_subscriptions.clone(),
+                                inner_senders.clone(),
+                                client_id.clone(),
+                            )?;
                         }
                     }
                 } else {
+                    // No more messages from the upstream channel
+                    // Breaking here will allow us to run the tear down code
+                    // below
                     break;
                 }
             }
 
-            // serve tear down
-            let mut client_subscriptions_guard = inner_client_subscriptions.write().unwrap();
+            // Task tear down
+            //
+            // As we have one task per channel regardless of the number of
+            // subscribers, when the task is over we can safely remove all
+            // subscribers from the channel, then remove the channel itself
+            // from the list of running tasks
+            inner_client_subscriptions
+                .write()
+                .expect(LOCK_POISONED_ERROR)
+                .remove_entry(&inner_channel);
 
-            // Remove current client from the channel
-            client_subscriptions_guard
-                .entry(inner_channel.clone())
-                .or_insert(HashSet::new())
-                .remove(&client_id);
-
-            // delete channel if empty
-            if let Some(clients) = client_subscriptions_guard.get(&inner_channel) {
-                if clients.is_empty() {
-                    client_subscriptions_guard.remove(&inner_channel);
-                }
-            }
+            inner_subscription_join_handlers
+                .write()
+                .expect(LOCK_POISONED_ERROR)
+                .remove(&inner_channel);
             Ok::<(), anyhow::Error>(())
         });
 
         self.subscription_join_handlers
             .write()
-            .unwrap()
+            .expect(LOCK_POISONED_ERROR)
             .insert(channel, subscription_join_handler);
-
         Ok(())
     }
 
-    async fn handle_unsubscribe(&self, client_id: String, channel: String) -> Result<()> {
+    /// Handles [BrokerMessage::Unsubscribe] messages
+    fn handle_unsubscribe(&self, client_id: String, channel: String) -> Result<()> {
         self.client_subscriptions
             .write()
-            .unwrap()
+            .expect(LOCK_POISONED_ERROR)
             .entry(channel.clone())
             .or_insert(HashSet::new())
             .remove(&client_id);
         Ok(())
     }
 
+    /// List to messages from Redis on the 'admin' channel
+    /// This channel receives commands to control the broker's behavior
+    ///
+    /// # Commands
+    ///
+    /// - subscribe:client_id:channel
+    /// - unsubscribe:client_id:channel
     async fn serve_admin_commands(
         redis_client: redis::Client,
         api_tx: mpsc::UnboundedSender<BrokerMessage>,
@@ -235,52 +319,56 @@ impl RedisBroker {
         let mut msg_stream = pubsub.on_message();
         while let Some(msg) = msg_stream.next().await {
             let payload: String = msg.get_payload()?;
-            let mut iter = payload.split(':');
-            let command = iter.next().ok_or(anyhow::anyhow!("No command"))?;
-            match command {
-                "subscribe" => {
-                    let client_id = iter.next().ok_or(anyhow::anyhow!("No client_id"))?;
-                    let channel = iter.next().ok_or(anyhow::anyhow!("No channel name"))?;
+            let admin_command = AdminCommand::try_from(payload)?;
+            match &admin_command.command {
+                AdminCommands::Subscribe(client_id, channel) => {
                     api_tx.send(BrokerMessage::Subscribe(
                         client_id.to_string(),
                         channel.to_string(),
                     ))?;
                 }
-                "unsubscribe" => {
-                    let client_id = iter.next().ok_or(anyhow::anyhow!("No client_id"))?;
-                    let channel = iter.next().ok_or(anyhow::anyhow!("No channel name"))?;
+                AdminCommands::Unsubscribe(client_id, channel) => {
                     api_tx.send(BrokerMessage::Unsubscribe(
                         client_id.to_string(),
                         channel.to_string(),
                     ))?;
                 }
-                _ => {}
+                command => {
+                    eprintln!("Command not implemented: {:?}", command);
+                }
             }
         }
         Ok(())
     }
 
-    pub async fn serve_broker_api(&mut self) -> Result<()> {
+    /// Listen to commands from the API channel and handle each command
+    async fn serve_broker_api(&mut self) -> Result<()> {
         while let Some(broker_message) = self.api_rx.recv().await {
             match broker_message {
                 BrokerMessage::ConnectClient(client_id, tx) => {
-                    self.handle_connect_client(client_id, tx).await?;
+                    self.handle_connect_client(client_id, tx)?;
                 }
                 BrokerMessage::DisconnectClient(client_id) => {
-                    self.handle_disconnect_client(client_id).await?;
+                    self.handle_disconnect_client(client_id)?;
                 }
                 BrokerMessage::Subscribe(client_id, channel) => {
                     self.handle_subscribe(client_id, channel).await?;
                 }
                 BrokerMessage::Unsubscribe(client_id, channel) => {
-                    self.handle_unsubscribe(client_id, channel).await?;
+                    self.handle_unsubscribe(client_id, channel)?;
                 }
             };
         }
         Ok(())
     }
 
-    /// TODO
+    /// Runs all tasks required for the broker to function concurrently
+    ///
+    /// This includes:
+    /// - Listening for messages on the 'admin' channel
+    /// - Listening for messages on the API channel
+    ///
+    /// If any of the tasks fail, the entire function will return an error
     pub async fn run(&mut self) -> Result<()> {
         let redis_client = self.redis_client.clone();
         let api_tx = self.api_tx.clone();

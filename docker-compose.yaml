@@ -1,6 +1,54 @@
 version: "3"
 services:
+  broadcast:
+    image: rcelha/broadcast-rs
+    build: .
+    command: ["-r", "redis://redis:6379", "--statsd-host", "graphite"]
+    depends_on:
+      redis:
+        condition: service_healthy
+
   redis:
     image: redis:6.2.0
     ports:
       - 6666:6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # Observability stack
+  grafana:
+    image: grafana/grafana
+    ports:
+      - 9999:3000
+
+  graphite:
+    image: graphiteapp/graphite-statsd
+    platform: linux/amd64
+    ports:
+      - 9990:80
+      - 8125:8125/udp
+
+  example_server:
+    image: rcelha/broadcast-rs-builder
+    build:
+      context: .
+      target: BUILDER
+    command: ["cargo", "run", "--release", "--example", "server"]
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  example_client:
+    image: rcelha/broadcast-rs-builder
+    build:
+      context: .
+      target: BUILDER
+    command: ["cargo", "run", "--release", "--example", "client"]
+    depends_on:
+      - broadcast
+
+volumes:
+  cargo:
