@@ -13,9 +13,18 @@ axum = { version = "0.7.4", features = ["ws"] }
 cadence = "1.1.0"
 clap = { version = "4.5.0", features = ["derive"] }
 futures = { version = "0.3.30" }
+opentelemetry_sdk = { version = "0.21.2", features = ["rt-tokio"] }
 redis = { version = "0.24.0", features = ["tokio-comp"] }
 tokio = { version = "1.36.0", features = ["full"] }
 tower = { version = "0.4.13", features = ["full"] }
+
+# Telemetry
+opentelemetry = "0.21.0"
+opentelemetry-otlp = "0.14.0"
+tower-http = { version = "0.5.1", features = ["trace"] }
+tracing = "0.1.40"
+tracing-opentelemetry = "0.22.0"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio-tungstenite = "0.21.0"

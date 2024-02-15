@@ -15,6 +15,8 @@ struct Cli {
     statsd_host: Option<String>,
     #[clap(long, default_value = "8125")]
     statsd_port: u16,
+    #[clap(long, default_value = None)]
+    otlp_endpoint: Option<String>,
 }
 
 impl Into<ServerConfig> for Cli {
@@ -25,6 +27,7 @@ impl Into<ServerConfig> for Cli {
             server_addr: self.bind,
             server_port: self.port,
             statsd_host_port: self.statsd_host.map(|host| (host, self.statsd_port)),
+            otlp_endpoint: self.otlp_endpoint,
         }
     }
 }

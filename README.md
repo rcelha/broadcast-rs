@@ -8,8 +8,9 @@
 - [x] Add cli options
 - [x] Transform the admin commands onto enum/struct
 - [x] Add statsd support
-- [ ] Add tracing
-- [ ] Add configurable logging
+- [x] Add tracing
+- [ ] Extend instrumentation (better traces)
+- [x] Add configurable logging (done via `tracing` stdout)
 - [x] Client-server example
 - [ ] More integration tests
 - [ ] Make RedisBroker generic over message type (String is hardcoded)?

@@ -58,6 +58,7 @@ pub fn server_config() -> ServerConfig {
         server_addr: s!("localhost"),
         server_port: 3000,
         statsd_host_port: None,
+        otlp_endpoint: None,
     }
 }
 

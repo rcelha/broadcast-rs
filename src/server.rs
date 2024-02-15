@@ -1,5 +1,6 @@
 use super::broker::{BrokerApi, RedisBroker};
 use anyhow::Result;
+use axum::extract::connect_info::ConnectInfo;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -9,18 +10,22 @@ use axum::{
     routing::get,
     Router,
 };
-use cadence::{prelude::*, BufferedUdpMetricSink, NopMetricSink, QueuingMetricSink, StatsdClient};
+use futures::{sink::SinkExt, stream::StreamExt};
 use std::{
     net::SocketAddr,
     sync::{Arc, RwLock},
 };
-
-//allows to extract the IP of connecting user
-use axum::extract::connect_info::ConnectInfo;
 use tokio::select;
 
-//allows to split the websocket stream into separate TX and RX branches
-use futures::{sink::SinkExt, stream::StreamExt};
+// statsd
+use cadence::{prelude::*, BufferedUdpMetricSink, NopMetricSink, QueuingMetricSink, StatsdClient};
+
+// tracing
+use opentelemetry::{global::shutdown_tracer_provider, KeyValue};
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::Resource;
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 #[derive(Clone)]
 struct AppState {
@@ -35,6 +40,7 @@ pub struct ServerConfig {
     pub server_addr: String,
     pub server_port: u16,
     pub statsd_host_port: Option<(String, u16)>,
+    pub otlp_endpoint: Option<String>,
 }
 
 fn setup_statsd_client(config: &ServerConfig) -> Result<StatsdClient> {
@@ -52,24 +58,64 @@ fn setup_statsd_client(config: &ServerConfig) -> Result<StatsdClient> {
     }
 }
 
+fn setup_tracer(config: &ServerConfig) -> Result<()> {
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .compact()
+        .with_filter(EnvFilter::from_default_env());
+
+    let registry = tracing_subscriber::registry().with(stdout_layer);
+
+    if let Some(endpoint) = &config.otlp_endpoint {
+        let tracer = opentelemetry_otlp::new_pipeline()
+            .tracing()
+            .with_exporter(
+                opentelemetry_otlp::new_exporter()
+                    .tonic()
+                    .with_endpoint(endpoint.clone()),
+            )
+            .with_trace_config(
+                opentelemetry_sdk::trace::config().with_resource(Resource::new(vec![
+                    KeyValue::new("service.name", "broadcast"),
+                ])),
+            )
+            .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+        let otlp_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let registry = registry.with(otlp_layer);
+        registry.init();
+    } else {
+        registry.init();
+    }
+    Ok(())
+}
+
+fn setup_broker(config: &ServerConfig) -> Result<RedisBroker> {
+    let mut broker_config = RedisBroker::config();
+    broker_config.redis_url = config.redis_url.clone();
+    broker_config.channel_capacity = config.channel_capacity;
+    let broker = broker_config.build()?;
+    Ok(broker)
+}
+
 /// TODO
 pub async fn start_server(config: ServerConfig) -> Result<()> {
     let statsd = setup_statsd_client(&config)?;
-    let mut broker_config = RedisBroker::config();
-    broker_config.redis_url = config.redis_url;
-    broker_config.channel_capacity = config.channel_capacity;
-    let mut broker = broker_config.build()?;
+    let mut broker = setup_broker(&config)?;
+    setup_tracer(&config)?;
 
     let app_state = AppState {
         broker: broker.api(),
         statsd: Arc::new(statsd),
     };
+
     let app = Router::new()
         .route("/ws/:user_id", get(ws_handler))
+        .layer(
+            TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::new().include_headers(true)),
+        )
         .with_state(app_state);
 
     let addr = format!("{}:{}", config.server_addr, config.server_port);
-    println!("Starting server on: {}", addr);
+    tracing::debug!("Starting server on: {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let http_server = || async move {
         axum::serve(
@@ -84,20 +130,20 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         result = broker.run() => { result.expect("Broker failed")}
     };
 
+    shutdown_tracer_provider();
     Ok(())
 }
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    connect_info: ConnectInfo<SocketAddr>,
+    _connect_info: ConnectInfo<SocketAddr>,
     Path(user_id): Path<String>,
     State(app_state): State<AppState>,
 ) -> impl IntoResponse {
-    let statsd = app_state.statsd.clone();
     ws.on_upgrade(|socket| async move {
         match serve_client(socket, user_id, app_state).await {
-            Ok(_) => println!("Client disconnected"),
-            Err(e) => eprintln!("Client Error: {}", e),
+            Ok(_) => tracing::info!("Client disconnected"),
+            Err(e) => tracing::error!("Client Error: {}", e),
         }
     })
 }
@@ -122,10 +168,11 @@ async fn serve_client(socket: WebSocket, user_id: String, app_state: AppState) -
     let msg_routing_task = async move {
         while let Some(msg) = bridge_rx.recv().await {
             if let Err(e) = socket_tx.send(msg).await {
-                eprintln!("Error sending message to client's socket: {}", e);
-                eprintln!("Assuming disconnection");
+                tracing::error!("Error sending message to client's socket: {}", e);
+                tracing::error!("Assuming disconnection");
                 break;
             }
+            tracing::debug!("Message sent to client");
             inner_statsd.count("messages_sent", 1).ok();
         }
 
@@ -145,10 +192,11 @@ async fn serve_client(socket: WebSocket, user_id: String, app_state: AppState) -
         let mut client_broker_rx = client_broker_tx.subscribe();
         while let Ok(msg) = client_broker_rx.recv().await {
             if let Err(e) = inner_bridge_tx.send(Message::Text(msg)).await {
-                eprintln!("Error sending message to client's mpsc channel: {}", e);
-                eprintln!("Assuming disconnection");
+                tracing::error!("Error sending message to client's mpsc channel: {}", e);
+                tracing::error!("Assuming disconnection");
                 break;
             }
+            tracing::debug!("Message sent to internal client channel");
         }
         // The client_broker_rx channel is closed, so we assume the client is disconnected
         inner_bridge_tx.send(Message::Close(None)).await.ok();
@@ -172,8 +220,8 @@ async fn serve_client(socket: WebSocket, user_id: String, app_state: AppState) -
                 .as_secs()
                 > 10
             {
-                eprintln!("No activities from the client for more than 10 seconds");
-                eprintln!("Assuming disconnection");
+                tracing::error!("No activities from the client for more than 10 seconds");
+                tracing::error!("Assuming disconnection");
                 break;
             }
         }

@@ -3,7 +3,17 @@ services:
   broadcast:
     image: rcelha/broadcast-rs
     build: .
-    command: ["-r", "redis://redis:6379", "--statsd-host", "graphite"]
+    command:
+      [
+        "-r",
+        "redis://redis:6379",
+        "--statsd-host",
+        "graphite",
+        "--otlp-endpoint",
+        "http://jaeger:4317",
+      ]
+    environment:
+      - RUST_LOG=debug
     depends_on:
       redis:
         condition: service_healthy
@@ -30,6 +40,14 @@ services:
     ports:
       - 9990:80
       - 8125:8125/udp
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    platform: linux/amd64
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - 16686:16686
 
   example_server:
     image: rcelha/broadcast-rs-builder
