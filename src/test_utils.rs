@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::server::{start_server, ServerConfig};
+use super::server::{App, ServerConfig};
 use anyhow::Result;
 use futures::Future;
 use tokio::{select, time::timeout};
@@ -25,7 +25,8 @@ where
 {
     let config = server_config();
     let config_param = config.clone();
-    let server_fut = start_server(config);
+    let app = App::new(config);
+    let server_fut = app.run();
 
     let sleepy_test_fn = || async move {
         sleep_millis(10).await; // give the server some time to start

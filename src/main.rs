@@ -36,7 +36,6 @@ impl Into<ServerConfig> for Cli {
 async fn main() {
     let args = Cli::parse();
     let server_config: ServerConfig = args.clone().into();
-    start_server(server_config)
-        .await
-        .expect("Broadcast server failed");
+    let app = App::new(server_config);
+    app.run().await.expect("Broadcast server failed");
 }

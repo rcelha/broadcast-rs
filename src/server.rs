@@ -1,3 +1,5 @@
+use crate::tracing::setup_tracer;
+
 use super::broker::{BrokerApi, RedisBroker};
 use anyhow::Result;
 use axum::extract::connect_info::ConnectInfo;
@@ -21,11 +23,7 @@ use tokio::select;
 use cadence::{prelude::*, BufferedUdpMetricSink, NopMetricSink, QueuingMetricSink, StatsdClient};
 
 // tracing
-use opentelemetry::KeyValue;
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::Resource;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
-use tracing_subscriber::{prelude::*, EnvFilter};
 
 #[derive(Clone)]
 struct AppState {
@@ -43,101 +41,91 @@ pub struct ServerConfig {
     pub otlp_endpoint: Option<String>,
 }
 
-fn setup_statsd_client(config: &ServerConfig) -> Result<StatsdClient> {
-    if let Some(host) = &config.statsd_host_port {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-        socket.set_nonblocking(true)?;
-        let udp_sink = BufferedUdpMetricSink::from(host, socket)?;
-        let sink = QueuingMetricSink::with_capacity(udp_sink, 1);
-        let statsd = StatsdClient::from_sink("statsd", sink);
-        Ok(statsd)
-    } else {
-        let sink = NopMetricSink {};
-        let statsd = StatsdClient::from_sink("statsd", sink);
-        Ok(statsd)
-    }
-}
+impl TryFrom<&ServerConfig> for StatsdClient {
+    type Error = anyhow::Error;
 
-fn setup_tracer(config: &ServerConfig) -> Result<()> {
-    let stdout_layer = tracing_subscriber::fmt::layer()
-        .compact()
-        .with_filter(EnvFilter::from_default_env());
-
-    let registry = tracing_subscriber::registry().with(stdout_layer);
-
-    if let Some(endpoint) = &config.otlp_endpoint {
-        let tracer = opentelemetry_otlp::new_pipeline()
-            .tracing()
-            .with_exporter(
-                opentelemetry_otlp::new_exporter()
-                    .tonic()
-                    .with_endpoint(endpoint.clone()),
-            )
-            .with_trace_config(
-                opentelemetry_sdk::trace::config().with_resource(Resource::new(vec![
-                    KeyValue::new("service.name", "broadcast"),
-                ])),
-            )
-            .install_batch(opentelemetry_sdk::runtime::Tokio)?;
-        let otlp_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-        let registry = registry.with(otlp_layer);
-        registry.init();
-    } else {
-        registry.init();
-    }
-    Ok(())
-}
-
-fn setup_broker(config: &ServerConfig) -> Result<RedisBroker> {
-    let mut broker_config = RedisBroker::config();
-    broker_config.redis_url = config.redis_url.clone();
-    broker_config.channel_capacity = config.channel_capacity;
-    let broker = broker_config.build()?;
-    Ok(broker)
-}
-
-/// TODO
-pub async fn start_server(config: ServerConfig) -> Result<()> {
-    let statsd = setup_statsd_client(&config)?;
-    let mut broker = setup_broker(&config)?;
-    setup_tracer(&config)?;
-
-    let app_state = AppState {
-        broker: broker.api(),
-        statsd: Arc::new(statsd),
-    };
-
-    let app = Router::new()
-        .route("/ws/:user_id", get(ws_handler))
-        .layer(
-            TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::new().include_headers(true)),
-        )
-        .with_state(app_state);
-
-    let addr = format!("{}:{}", config.server_addr, config.server_port);
-    tracing::debug!("Starting server on: {}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let http_server = || async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-    };
-
-    let result = select! {
-        result = http_server() => {
-            tracing::error!("HTTP server finished: {:?}", result);
-            anyhow::Ok(result?)
-        },
-        result = broker.run() => {
-            tracing::error!("Broker finished: {:?}", result);
-            result
+    fn try_from(config: &ServerConfig) -> Result<Self> {
+        if let Some(host) = config.statsd_host_port.clone() {
+            let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+            socket.set_nonblocking(true)?;
+            let udp_sink = BufferedUdpMetricSink::from(host, socket)?;
+            let sink = QueuingMetricSink::with_capacity(udp_sink, 1);
+            let statsd = StatsdClient::from_sink("statsd", sink);
+            Ok(statsd)
+        } else {
+            let sink = NopMetricSink {};
+            let statsd = StatsdClient::from_sink("statsd", sink);
+            Ok(statsd)
         }
-    };
-    result
+    }
 }
 
+impl TryFrom<&ServerConfig> for RedisBroker {
+    type Error = anyhow::Error;
+
+    fn try_from(config: &ServerConfig) -> Result<Self> {
+        let mut broker_config = RedisBroker::config();
+        broker_config.redis_url = config.redis_url.clone();
+        broker_config.channel_capacity = config.channel_capacity;
+        let broker = broker_config.build()?;
+        Ok(broker)
+    }
+}
+
+pub struct App {
+    config: ServerConfig,
+}
+
+impl App {
+    pub fn new(config: ServerConfig) -> Self {
+        App { config }
+    }
+
+    pub async fn run(&self) -> Result<()> {
+        let config = self.config.clone();
+        let statsd = StatsdClient::try_from(&config)?;
+        let mut broker = RedisBroker::try_from(&config)?;
+        setup_tracer(&config)?;
+
+        let app_state = AppState {
+            broker: broker.api(),
+            statsd: Arc::new(statsd),
+        };
+
+        let router = Router::new()
+            .route("/ws/:user_id", get(ws_handler))
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(DefaultMakeSpan::new().include_headers(true)),
+            )
+            .with_state(app_state);
+
+        let addr = format!("{}:{}", config.server_addr, config.server_port);
+        tracing::debug!("Starting server on: {}", addr);
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let http_server = || async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        };
+
+        let result = select! {
+            result = http_server() => {
+                tracing::error!("HTTP server finished: {:?}", result);
+                anyhow::Ok(result?)
+            },
+            result = broker.run() => {
+                tracing::error!("Broker finished: {:?}", result);
+                result
+            }
+        };
+        result
+    }
+}
+
+/// Upgrade the HTTP connection to a WebSocket connection
 async fn ws_handler(
     ws: WebSocketUpgrade,
     _connect_info: ConnectInfo<SocketAddr>,
@@ -152,6 +140,8 @@ async fn ws_handler(
     })
 }
 
+/// TODO holy mollly, this function is huge. Let's break it down later
+///
 /// This function is responsible for handling the websocket connection
 ///
 /// It will run a few tasks on background
