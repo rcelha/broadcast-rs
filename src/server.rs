@@ -21,7 +21,7 @@ use tokio::select;
 use cadence::{prelude::*, BufferedUdpMetricSink, NopMetricSink, QueuingMetricSink, StatsdClient};
 
 // tracing
-use opentelemetry::{global::shutdown_tracer_provider, KeyValue};
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
@@ -125,13 +125,17 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         .await
     };
 
-    select! {
-        result = http_server() => { result.expect("Server failed")},
-        result = broker.run() => { result.expect("Broker failed")}
+    let result = select! {
+        result = http_server() => {
+            tracing::error!("HTTP server finished: {:?}", result);
+            anyhow::Ok(result?)
+        },
+        result = broker.run() => {
+            tracing::error!("Broker finished: {:?}", result);
+            result
+        }
     };
-
-    shutdown_tracer_provider();
-    Ok(())
+    result
 }
 
 async fn ws_handler(
@@ -258,6 +262,7 @@ async fn serve_client(socket: WebSocket, user_id: String, app_state: AppState) -
                                 .unsubscribe(inner_user_id.clone(), channel)
                                 .await?;
                         }
+
                         _ => {}
                     }
                 }

@@ -181,13 +181,10 @@ impl RedisBroker {
 
     /// Handles [BokerMessage::Subscribe] messages
     async fn handle_subscribe(&self, client_id: String, channel: String) -> Result<()> {
-        let conn = self.redis_client.get_tokio_connection().await?;
+        tracing::debug!("handle_subscribe({}, {})", client_id, channel);
 
         let client_subscriptions = self.client_subscriptions.clone();
         let senders = self.senders.clone();
-
-        let mut pubsub = conn.into_pubsub();
-        pubsub.subscribe(channel.clone()).await?;
 
         client_subscriptions
             .clone()
@@ -210,12 +207,17 @@ impl RedisBroker {
         let inner_senders = senders.clone();
         let inner_channel = channel.clone();
         let inner_subscription_join_handlers = self.subscription_join_handlers.clone();
+        let redis_client = self.redis_client.clone();
+        let conn = redis_client.get_tokio_connection().await?;
 
         let subscription_join_handler = tokio::spawn(async move {
+            let mut pubsub = conn.into_pubsub();
+            pubsub.subscribe(inner_channel.clone()).await?;
+            let mut msg_stream = pubsub.on_message();
+
             // TODO handle error
             // Serve loop
             loop {
-                let mut msg_stream = pubsub.on_message();
                 if let Some(msg) = msg_stream.next().await {
                     let payload: String = msg.get_payload()?;
                     for client_id in inner_client_subscriptions
@@ -259,10 +261,28 @@ impl RedisBroker {
                         }
                     }
                 } else {
-                    // No more messages from the upstream channel
-                    // Breaking here will allow us to run the tear down code
-                    // below
-                    break;
+                    tracing::warn!("No more messages from the upstream channel");
+                    // Drop stream without losing the msg_stream var
+                    msg_stream.collect::<Vec<_>>().await;
+                    // If the connection was lost, we need to reconnect
+                    // TODO backoff
+                    let mut conn = pubsub.into_connection().await;
+                    let pong = redis::cmd("PING").query_async::<_, String>(&mut conn).await;
+                    if let Err(e) = pong {
+                        tracing::error!(
+                            "Lost broker's connection to redis. Trying to reconnect ({:?})",
+                            e
+                        );
+                        conn = redis_client.get_tokio_connection().await?;
+                        pubsub = conn.into_pubsub();
+                        pubsub.subscribe(inner_channel.clone()).await?;
+                        msg_stream = pubsub.on_message();
+                    } else {
+                        // No more messages from the upstream channel and there was no disconnect
+                        // Breaking here will allow us to run the tear down code
+                        // below
+                        break;
+                    }
                 }
             }
 
@@ -309,14 +329,18 @@ impl RedisBroker {
     ///
     /// - subscribe:client_id:channel
     /// - unsubscribe:client_id:channel
+    #[async_recursion::async_recursion]
     async fn serve_admin_commands(
         redis_client: redis::Client,
         api_tx: mpsc::UnboundedSender<BrokerMessage>,
     ) -> Result<()> {
         let conn = redis_client.get_tokio_connection().await?;
+
         let mut pubsub = conn.into_pubsub();
         pubsub.subscribe("admin").await?;
         let mut msg_stream = pubsub.on_message();
+        tracing::error!("Waiting for new messages on admin channel");
+
         while let Some(msg) = msg_stream.next().await {
             let payload: String = msg.get_payload()?;
             let admin_command = AdminCommand::try_from(payload)?;
@@ -333,10 +357,27 @@ impl RedisBroker {
                         channel.to_string(),
                     ))?;
                 }
+                AdminCommands::Shutdown => {
+                    tracing::info!("Shutting down admin commands server");
+                    break;
+                }
                 command => {
-                    eprintln!("Command not implemented: {:?}", command);
+                    tracing::error!("Command not implemented: {:?}", command);
                 }
             }
+        }
+        drop(msg_stream);
+
+        // Test if terminated because the connection was lost
+        let mut conn = pubsub.into_connection().await;
+        let pong = redis::cmd("PING").query_async::<_, String>(&mut conn).await;
+
+        if let Err(e) = pong {
+            tracing::error!(
+                "Lost admin connection to redis. Trying to reconnect ({:?})",
+                e
+            );
+            return Self::serve_admin_commands(redis_client, api_tx).await;
         }
         Ok(())
     }
@@ -374,11 +415,17 @@ impl RedisBroker {
         let api_tx = self.api_tx.clone();
         let admin_commands = Self::serve_admin_commands(redis_client, api_tx);
         let broker_api = self.serve_broker_api();
-        tokio::select! {
-            r = admin_commands => { r}
-            r = broker_api => {r}
-        }?;
-        Ok(())
+        let result = tokio::select! {
+            r = admin_commands => {
+                tracing::error!("Admin commands server finished: {:?}", r);
+                r
+            }
+            r = broker_api => {
+                tracing::error!("Broker API finished: {:?}", r);
+                r
+            }
+        };
+        result
     }
 }
 

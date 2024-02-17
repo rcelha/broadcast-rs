@@ -13,4 +13,5 @@
 - [x] Add configurable logging (done via `tracing` stdout)
 - [x] Client-server example
 - [ ] More integration tests
+- [x] Reconnect to redis when needed
 - [ ] Make RedisBroker generic over message type (String is hardcoded)?

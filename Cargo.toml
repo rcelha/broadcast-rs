@@ -25,6 +25,7 @@ tower-http = { version = "0.5.1", features = ["trace"] }
 tracing = "0.1.40"
 tracing-opentelemetry = "0.22.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+async-recursion = "1.0.5"
 
 [dev-dependencies]
 tokio-tungstenite = "0.21.0"

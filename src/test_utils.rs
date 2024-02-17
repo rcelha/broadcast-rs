@@ -18,10 +18,10 @@ pub use std::format as s;
 ///    }).await
 /// }
 /// ```
-pub async fn with_server<F, G, O>(test_fn: F) -> Result<O>
+pub async fn with_server<F, G>(test_fn: F) -> Result<()>
 where
     F: FnOnce(ServerConfig) -> G,
-    G: Future<Output = Result<O>>,
+    G: Future<Output = Result<()>>,
 {
     let config = server_config();
     let config_param = config.clone();
@@ -33,7 +33,7 @@ where
     };
 
     select! {
-        _ = server_fut => { Err(anyhow::anyhow!("Server failed")) }
+        result = server_fut => result,
         test_result = sleepy_test_fn() => test_result,
     }
 }
