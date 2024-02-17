@@ -8,11 +8,13 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::admin_commands::{AdminCommand, AdminCommands};
 
 type CHashMap<K, V> = Arc<RwLock<HashMap<K, V>>>;
+type ClientMessage = Arc<String>;
+
 static LOCK_POISONED_ERROR: &str = "Lock poisoned: This is an unrecoverable error";
 
 #[derive(Debug)]
 pub enum BrokerMessage {
-    ConnectClient(String, oneshot::Sender<broadcast::Sender<String>>),
+    ConnectClient(String, oneshot::Sender<broadcast::Sender<ClientMessage>>),
     DisconnectClient(String),
     // client, channel
     Subscribe(String, String),
@@ -69,7 +71,7 @@ pub struct RedisBroker {
     pub channel_capacity: usize,
 
     /// A sender for the broker to send messages to the clients. The key is the client's id.
-    pub senders: CHashMap<String, broadcast::Sender<String>>,
+    pub senders: CHashMap<String, broadcast::Sender<ClientMessage>>,
 
     /// A map of subscriptions. The key is the channel, and the value is a list of client ids.
     pub client_subscriptions: CHashMap<String, HashSet<String>>,
@@ -138,7 +140,7 @@ impl RedisBroker {
     fn handle_connect_client(
         &self,
         client_id: String,
-        tx: oneshot::Sender<broadcast::Sender<String>>,
+        tx: oneshot::Sender<broadcast::Sender<ClientMessage>>,
     ) -> Result<()> {
         let (broadcast_tx, _) = broadcast::channel(self.channel_capacity);
         self.senders
@@ -160,7 +162,7 @@ impl RedisBroker {
 
     fn disconnect_client(
         client_subscriptions: CHashMap<String, HashSet<String>>,
-        senders: CHashMap<String, broadcast::Sender<String>>,
+        senders: CHashMap<String, broadcast::Sender<ClientMessage>>,
         client_id: String,
     ) -> Result<()> {
         let mut client_subscriptions_guard =
@@ -174,7 +176,7 @@ impl RedisBroker {
             .expect(LOCK_POISONED_ERROR)
             .remove(&client_id);
 
-        client_tx.and_then(|tx| tx.send("#DISCONNECTED#".to_string()).ok()); // TODO handle on the other side
+        client_tx.and_then(|tx| tx.send(Arc::new("#DISCONNECTED#".to_string())).ok()); // TODO handle on the other side
 
         Ok(())
     }
@@ -220,6 +222,8 @@ impl RedisBroker {
             loop {
                 if let Some(msg) = msg_stream.next().await {
                     let payload: String = msg.get_payload()?;
+                    let payload = Arc::new(payload);
+
                     for client_id in inner_client_subscriptions
                         .read()
                         .expect(LOCK_POISONED_ERROR)
@@ -231,9 +235,7 @@ impl RedisBroker {
                             .expect(LOCK_POISONED_ERROR)
                             .get(client_id)
                         {
-                            // TODO Stop cloning the payload
-                            // TODO maybe I can use `Cow<'static, &str>` instead
-                            let send_result = sender.send(payload.clone());
+                            let send_result = sender.send(Arc::clone(&payload));
 
                             // Receiver cannot receive messages at the moment
                             // For now, we will assume the client is disconnected
@@ -442,7 +444,10 @@ impl BrokerApi {
         Self { broker_tx }
     }
 
-    pub async fn connect_client(&self, client_id: String) -> Result<broadcast::Sender<String>> {
+    pub async fn connect_client(
+        &self,
+        client_id: String,
+    ) -> Result<broadcast::Sender<ClientMessage>> {
         let (tx, rx) = oneshot::channel();
         self.broker_tx
             .send(BrokerMessage::ConnectClient(client_id, tx))?;

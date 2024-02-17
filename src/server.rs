@@ -185,6 +185,9 @@ async fn serve_client(socket: WebSocket, user_id: String, app_state: AppState) -
     let bridge_task = async move {
         let mut client_broker_rx = client_broker_tx.subscribe();
         while let Ok(msg) = client_broker_rx.recv().await {
+            // Transforms from Arc<String> into String as the [[Message::Text]] expects
+            let msg = &*msg;
+            let msg = msg.clone();
             if let Err(e) = inner_bridge_tx.send(Message::Text(msg)).await {
                 tracing::error!("Error sending message to client's mpsc channel: {}", e);
                 tracing::error!("Assuming disconnection");
