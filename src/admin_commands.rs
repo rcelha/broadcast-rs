@@ -17,7 +17,7 @@ pub struct AdminCommand {
 impl TryFrom<String> for AdminCommand {
     type Error = anyhow::Error;
     fn try_from(s: String) -> Result<AdminCommand, Self::Error> {
-        let mut parts = s.split(":");
+        let mut parts = s.split(':');
         let command = match parts.next() {
             Some("shutdown") => AdminCommands::Shutdown,
             Some("restart") => AdminCommands::Restart,
@@ -54,8 +54,8 @@ impl TryFrom<String> for AdminCommand {
     }
 }
 
-impl Into<String> for AdminCommand {
-    fn into(self) -> String {
-        self.underlying
+impl From<AdminCommand> for String {
+    fn from(val: AdminCommand) -> Self {
+        val.underlying
     }
 }

@@ -1,6 +1,10 @@
+use crate::broker::{run_broker, Broker, BrokerConfig, EitherConfig};
+use crate::broker_http::{HttpBroker, HttpBrokerConfig};
+use crate::broker_redis::RedisBrokerConfig;
 use crate::tracing::setup_tracer;
 
-use super::broker::{BrokerApi, RedisBroker};
+use super::broker_api::BrokerApi;
+use super::broker_redis::RedisBroker;
 use anyhow::Result;
 use axum::extract::connect_info::ConnectInfo;
 use axum::{
@@ -12,6 +16,7 @@ use axum::{
     routing::get,
     Router,
 };
+use either::Either;
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::{
     net::SocketAddr,
@@ -32,9 +37,14 @@ struct AppState {
 }
 
 #[derive(Debug, Clone)]
+pub enum BackendConfig {
+    RedisBackend(RedisBrokerConfig),
+    HttpBackend(HttpBrokerConfig),
+}
+
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
-    pub redis_url: String,
-    pub channel_capacity: usize,
+    pub backend: BackendConfig,
     pub server_addr: String,
     pub server_port: u16,
     pub statsd_host_port: Option<(String, u16)>,
@@ -60,16 +70,24 @@ impl TryFrom<&ServerConfig> for StatsdClient {
     }
 }
 
-impl TryFrom<&ServerConfig> for RedisBroker {
-    type Error = anyhow::Error;
-
-    fn try_from(config: &ServerConfig) -> Result<Self> {
-        let mut broker_config = RedisBroker::config();
-        broker_config.redis_url = config.redis_url.clone();
-        broker_config.channel_capacity = config.channel_capacity;
-        let broker = broker_config.build()?;
-        Ok(broker)
-    }
+fn get_broker_config(config: &ServerConfig) -> Result<Either<RedisBroker, HttpBroker>> {
+    let config = match &config.backend {
+        BackendConfig::RedisBackend(redis_config) => {
+            let mut broker_config = RedisBroker::config();
+            broker_config.redis_url = redis_config.redis_url.clone();
+            broker_config.channel_capacity = redis_config.channel_capacity;
+            Either::Left(broker_config)
+        }
+        BackendConfig::HttpBackend(http_config) => {
+            let mut broker_config = HttpBroker::config();
+            broker_config.port = http_config.port;
+            broker_config.channel_capacity = http_config.channel_capacity;
+            Either::Right(broker_config)
+        }
+    };
+    let mut either_config = EitherConfig::default();
+    either_config.0 = config;
+    either_config.build()
 }
 
 pub struct App {
@@ -84,7 +102,8 @@ impl App {
     pub async fn run(&self) -> Result<()> {
         let config = self.config.clone();
         let statsd = StatsdClient::try_from(&config)?;
-        let mut broker = RedisBroker::try_from(&config)?;
+        let mut broker = get_broker_config(&config)?;
+
         setup_tracer(&config)?;
 
         let app_state = AppState {
@@ -116,7 +135,7 @@ impl App {
                 tracing::error!("HTTP server finished: {:?}", result);
                 anyhow::Ok(result?)
             },
-            result = broker.run() => {
+            result = run_broker(&mut broker) => {
                 tracing::error!("Broker finished: {:?}", result);
                 result
             }

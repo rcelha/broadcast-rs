@@ -3,9 +3,9 @@
 ## MVP
 
 - [ ] Authentication
-- [ ] Broker trait - Support different brokers - Add a second Broker (HttpBroker)
 - [ ] Extend instrumentation (better traces)
 - [ ] More integration tests
+- [x] Broker trait - Support different brokers - Add a second Broker (HttpBroker)
 - [?] Support binary messages (i.e. so we can use protobuf)
 - [?] Make RedisBroker generic over message type (String is hardcoded)
 - [x] Add configurable logging (done via `tracing` stdout)

@@ -19,15 +19,17 @@ struct Cli {
     otlp_endpoint: Option<String>,
 }
 
-impl Into<ServerConfig> for Cli {
-    fn into(self) -> ServerConfig {
+impl From<Cli> for ServerConfig {
+    fn from(cli: Cli) -> Self {
         ServerConfig {
-            redis_url: self.redis_url,
-            channel_capacity: self.channel_capacity,
-            server_addr: self.bind,
-            server_port: self.port,
-            statsd_host_port: self.statsd_host.map(|host| (host, self.statsd_port)),
-            otlp_endpoint: self.otlp_endpoint,
+            backend: BackendConfig::RedisBackend(RedisBrokerConfig {
+                redis_url: cli.redis_url,
+                channel_capacity: cli.channel_capacity,
+            }),
+            server_addr: cli.bind,
+            server_port: cli.port,
+            statsd_host_port: cli.statsd_host.map(|host| (host, cli.statsd_port)),
+            otlp_endpoint: cli.otlp_endpoint,
         }
     }
 }

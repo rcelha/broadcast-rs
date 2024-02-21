@@ -26,6 +26,8 @@ tracing = "0.1.40"
 tracing-opentelemetry = "0.22.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-recursion = "1.0.5"
+either = "1.10.0"
 
 [dev-dependencies]
+reqwest = "0.11.24"
 tokio-tungstenite = "0.21.0"
