@@ -1,336 +1,292 @@
-use std::collections::{HashMap, HashSet};
-
 use anyhow::Result;
-use futures::StreamExt;
-use std::sync::{Arc, RwLock};
+use either::Either;
+use futures::Future;
+use std::{marker::PhantomData, sync::Arc};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-type CHashMap<K, V> = Arc<RwLock<HashMap<K, V>>>;
+use crate::broker_api::{BrokerApi, BrokerCommand};
 
-#[derive(Debug)]
-pub enum BrokerMessage {
-    ConnectClient(String, oneshot::Sender<broadcast::Sender<String>>),
-    DisconnectClient(String),
-    // client, channel
-    Subscribe(String, String),
-    // client, channel
-    Unsubscribe(String, String),
-}
+type ClientMessage = Arc<String>;
 
-/// Builder-pattern for RedisBroker
+/// Builder-pattern for a Broker's implementation
 ///
-/// # Example
+/// Every broker should also have a `BrokerConfig` implementation.
 ///
-/// ```rust
-/// # use broadcast_rs::broker::RedisBrokerConfig;
-/// # use anyhow::Result;
-/// # async fn run() -> Result<()> {
-///     let mut broker_config = RedisBrokerConfig::new();
-///     broker_config.redis_url = "redis://localhost:6666/".to_string();
-///     broker_config.channel_capacity = 100;
-///     let mut broker = broker_config.build()?;
-///     broker.run().await?;
-///     Ok(())
-/// # }
-/// ```
-#[derive(Clone, Default)]
-pub struct RedisBrokerConfig {
-    pub redis_url: String,
-    pub channel_capacity: usize,
-}
-
-impl RedisBrokerConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn build(self) -> Result<RedisBroker> {
-        RedisBroker::from_config(self)
+/// There is an auto implementation for every type that implements `Broker`,
+/// as long as the Broker has a `Config` type.
+pub trait BrokerConfig<T: Broker + TryFrom<Self>>: Clone + Default {
+    fn build(self) -> Result<T> {
+        let target = T::try_from(self).or(Err(anyhow::anyhow!("Failed to convert config")))?;
+        anyhow::Ok(target)
     }
 }
 
-/// A broker that listens for messages on a redis channel and sends them to clients.
-///
-/// The flow of the broker is (simplified) as follows:
-/// 1. The broker starts and connects to redis.
-/// 2. The broker listens for messages on the "global" channel with [[RedisBroker::serve_broker]]
-/// 3. Clients connect to the broker. The broker creates a new channel for each client.
-/// 4. Clients subscribe to the broker's channel by sending a message to the broker. The broker
-///   listens for these messages and adds to its internal list of subscriptions.
-/// 5. When the broker receives a message, it routes to the appropriate client's channel.
-///
-/// TODO: Make it generic over message type
-pub struct RedisBroker {
-    pub redis_client: redis::Client,
-    pub channel_capacity: usize,
-
-    /// A sender for the broker to send messages to the clients. The key is the client's id.
-    pub senders: CHashMap<String, broadcast::Sender<String>>,
-
-    /// A map of subscriptions. The key is the channel, and the value is a list of client ids.
-    pub client_subscriptions: CHashMap<String, HashSet<String>>,
-
-    /// join handlers
-    pub subscription_join_handlers: CHashMap<String, tokio::task::JoinHandle<Result<()>>>,
-
-    /// (channel, client_id)
-    pub api_tx: mpsc::UnboundedSender<BrokerMessage>,
-    pub api_rx: mpsc::UnboundedReceiver<BrokerMessage>,
+impl<T, C> BrokerConfig<T> for C
+where
+    T: Broker<Config = C> + TryFrom<Self>,
+    C: Clone + Default,
+{
 }
 
-impl RedisBroker {
-    /// Create a new RedisBroker with default configuration
+/// A broker is a message broker that can handle multiple clients
+///
+/// This trait expresses the minimal requirements for a broker's backend implementation,
+/// and it also implements automatically its interaction with [[BrokerApi]]
+pub trait Broker: Sized + Send + TryFrom<Self::Config> {
+    type Config: BrokerConfig<Self>;
+
+    /// Getter for the [BrokerApi] sender channel
+    fn api_tx(&self) -> &mpsc::UnboundedSender<BrokerCommand>;
+
+    /// Getter for the [BrokerApi] receiver channel
+    fn api_rx(&mut self) -> &mut mpsc::UnboundedReceiver<BrokerCommand>;
+
+    /// Handles [BrokerCommand::ConnectClient] messages
+    fn handle_connect_client(
+        &self,
+        client_id: String,
+        tx: oneshot::Sender<broadcast::Sender<ClientMessage>>,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Handles [BrokerCommand::DisconnectClient] messages
+    fn handle_disconnect_client(
+        &self,
+        client_id: String,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Handles [BrokerCommand::Subscribe] messages
+    fn handle_subscribe(
+        &self,
+        client_id: String,
+        channel: String,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Handles [BrokerCommand::Unsubscribe] messages
+    fn handle_unsubscribe(
+        &self,
+        client_id: String,
+        channel: String,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Async function to setup and run any taks required for the broker to function
+    /// with the backend of your choice
+    ///
+    /// It is important to understand its lifetimes: The future it returns needs to
+    /// outlive `self`. That means your server loop cannot depend on `self`, but it
+    /// needs to rely on cloned values
+    ///
+    /// # Example
     ///
     /// ```ignore
-    /// # use broadcast_rs::broker::RedisBroker;
-    /// let broker = RedisBroker::config().build()?;
+    /// impl Broker for MyBroker {
+    ///
+    /// // (...)
+    ///
+    ///  fn run_backend_server<'a, 'b: 'a>(&'a self) -> impl Future<Output = Result<()>> + Send + 'b {
+    ///         let inner_field = self.field.clone();
+    ///         async {
+    ///             // This block can use `inner_field` but not `self`
+    ///         }
+    ///     }
+    ///
+    /// // (...)
+    ///
+    /// }
     /// ```
-    pub fn config() -> RedisBrokerConfig {
-        RedisBrokerConfig::default()
+    fn run_backend_server<'broker, 'fut>(
+        &'broker self,
+    ) -> impl Future<Output = Result<()>> + Send + 'fut
+    where
+        'fut: 'broker;
+
+    /// Creates a new config instance with default values
+    /// This is handy so one don't need to know the actual config type
+    ///
+    /// ```ignore
+    /// let broker = MyBroker::config().build()?;
+    /// ```
+    fn config() -> Self::Config {
+        Self::Config::default()
     }
 
-    // TODO move it to `impl From` trait
-    pub fn from_config(config: RedisBrokerConfig) -> Result<Self> {
-        let (api_tx, api_rx) = mpsc::unbounded_channel();
-        let redis_client = redis::Client::open(config.redis_url.as_str())?;
-
-        let new_self = RedisBroker {
-            channel_capacity: config.channel_capacity,
-            api_tx,
-            api_rx,
-            redis_client,
-            senders: Default::default(),
-            client_subscriptions: Default::default(),
-            subscription_join_handlers: Default::default(),
-        };
-        Ok(new_self)
+    /// Creates a new broker api instance to interact with the broker
+    fn api(&self) -> BrokerApi {
+        BrokerApi::new(self.api_tx().clone())
     }
 
-    /// Create a new API object for this broker
-    pub fn api(&self) -> BrokerApi {
-        BrokerApi::new(self.api_tx.clone())
+    /// Listens to messages coming thought [BrokerApi] and route each message
+    /// to the appropriate handler
+    fn run_broker_api_server(&mut self) -> impl Future<Output = Result<()>> + Send {
+        async {
+            while let Some(broker_message) = self.api_rx().recv().await {
+                match broker_message {
+                    BrokerCommand::ConnectClient(client_id, tx) => {
+                        self.handle_connect_client(client_id, tx).await?;
+                    }
+                    BrokerCommand::DisconnectClient(client_id) => {
+                        self.handle_disconnect_client(client_id).await?;
+                    }
+                    BrokerCommand::Subscribe(client_id, channel) => {
+                        self.handle_subscribe(client_id, channel).await?;
+                    }
+                    BrokerCommand::Unsubscribe(client_id, channel) => {
+                        self.handle_unsubscribe(client_id, channel).await?;
+                    }
+                };
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Runs all tasks required for the broker to function concurrently
+///
+/// This includes:
+/// - Listening for messages on the 'admin' channel
+/// - Listening for messages on the API channel
+///
+/// If any of the tasks fail, the entire function will return an error
+///
+/// **WARNING**:
+///
+/// This function is supposed to be part of the [Broker] trait, but it is
+/// not possible at the moment due this
+/// [issue](https://github.com/rust-lang/rust/issues/100013) might be a blocker
+pub async fn run_broker<T: Broker>(broker: &mut T) -> Result<()> {
+    let admin_commands = broker.run_backend_server();
+    let broker_api = broker.run_broker_api_server();
+    let result = tokio::select! {
+        r = admin_commands => {
+            tracing::error!("Admin commands server finished: {:?}", r);
+            r
+        }
+        r = broker_api => {
+            tracing::error!("Broker API finished: {:?}", r);
+            r
+        }
+    };
+    result
+}
+
+/// A broker that can be configured to use one of two different brokers
+
+pub struct EitherConfig<B1, B2, C1, C2>(pub either::Either<C1, C2>, PhantomData<(B1, B2)>)
+where
+    B1: Broker<Config = C1> + TryFrom<C1>,
+    B2: Broker<Config = C2> + TryFrom<C2>,
+    C1: BrokerConfig<B1> + Clone,
+    C2: BrokerConfig<B2> + Clone;
+
+impl<B1, B2, C1, C2> Clone for EitherConfig<B1, B2, C1, C2>
+where
+    B1: Broker<Config = C1> + TryFrom<C1>,
+    B2: Broker<Config = C2> + TryFrom<C2>,
+    C1: BrokerConfig<B1> + Clone,
+    C2: BrokerConfig<B2> + Clone,
+{
+    fn clone(&self) -> Self {
+        EitherConfig(self.0.clone(), PhantomData {})
+    }
+}
+
+impl<B1, B2, C1, C2> Default for EitherConfig<B1, B2, C1, C2>
+where
+    B1: Broker<Config = C1> + TryFrom<C1>,
+    B2: Broker<Config = C2> + TryFrom<C2>,
+    C1: BrokerConfig<B1> + Clone,
+    C2: BrokerConfig<B2> + Clone,
+{
+    fn default() -> Self {
+        EitherConfig(either::Either::Left(C1::default()), PhantomData {})
+    }
+}
+
+impl<B1, B2, C1, C2> TryFrom<EitherConfig<B1, B2, C1, C2>> for Either<B1, B2>
+where
+    B1: Broker<Config = C1> + TryFrom<C1>,
+    B2: Broker<Config = C2> + TryFrom<C2>,
+    C1: BrokerConfig<B1> + Clone,
+    C2: BrokerConfig<B2> + Clone,
+{
+    type Error = anyhow::Error;
+
+    fn try_from(val: EitherConfig<B1, B2, C1, C2>) -> std::prelude::v1::Result<Self, Self::Error> {
+        match val.0 {
+            either::Either::Left(c) => Ok(Either::Left(c.build()?)),
+            either::Either::Right(c) => Ok(Either::Right(c.build()?)),
+        }
+    }
+}
+
+impl<B1, B2, C1, C2> Broker for Either<B1, B2>
+where
+    B1: Broker<Config = C1> + Sync + TryFrom<C1>,
+    B2: Broker<Config = C2> + Sync + TryFrom<C2>,
+    C1: BrokerConfig<B1> + Clone,
+    C2: BrokerConfig<B2> + Clone,
+{
+    type Config = EitherConfig<B1, B2, C1, C2>;
+
+    fn api_tx(&self) -> &tokio::sync::mpsc::UnboundedSender<crate::broker_api::BrokerCommand> {
+        match self {
+            Either::Left(b) => b.api_tx(),
+            Either::Right(b) => b.api_tx(),
+        }
+    }
+
+    fn api_rx(
+        &mut self,
+    ) -> &mut tokio::sync::mpsc::UnboundedReceiver<crate::broker_api::BrokerCommand> {
+        match self {
+            Either::Left(b) => b.api_rx(),
+            Either::Right(b) => b.api_rx(),
+        }
     }
 
     async fn handle_connect_client(
         &self,
         client_id: String,
-        tx: oneshot::Sender<broadcast::Sender<String>>,
+        tx: oneshot::Sender<broadcast::Sender<ClientMessage>>,
     ) -> Result<()> {
-        let (broadcast_tx, _) = broadcast::channel(self.channel_capacity);
-        self.senders
-            .write()
-            .unwrap()
-            .insert(client_id, broadcast_tx.clone());
-        tx.send(broadcast_tx).expect("TODO");
-        Ok(())
+        match self {
+            Either::Left(b) => b.handle_connect_client(client_id, tx).await,
+            Either::Right(b) => b.handle_connect_client(client_id, tx).await,
+        }
     }
 
+    /// Handles [BrokerCommand::DisconnectClient] messages
     async fn handle_disconnect_client(&self, client_id: String) -> Result<()> {
-        let mut client_subscriptions = self.client_subscriptions.write().unwrap();
-        for i in client_subscriptions.values_mut() {
-            i.remove(&client_id);
+        match self {
+            Either::Left(b) => b.handle_disconnect_client(client_id).await,
+            Either::Right(b) => b.handle_disconnect_client(client_id).await,
         }
-        let client_tx = self.senders.write().unwrap().remove(&client_id);
-        client_tx.and_then(|tx| tx.send("#DISCONNECTED#".to_string()).ok()); // TODO handle on the other side
-        Ok(())
     }
 
     async fn handle_subscribe(&self, client_id: String, channel: String) -> Result<()> {
-        let conn = self.redis_client.get_tokio_connection().await?;
-
-        let client_subscriptions = self.client_subscriptions.clone();
-        let senders = self.senders.clone();
-
-        let mut pubsub = conn.into_pubsub();
-        pubsub.subscribe(channel.clone()).await?;
-
-        client_subscriptions
-            .clone()
-            .write()
-            .unwrap()
-            .entry(channel.clone())
-            .or_insert(HashSet::new())
-            .insert(client_id.clone());
-
-        if let Some(_) = self
-            .subscription_join_handlers
-            .read()
-            .unwrap()
-            .get(&channel)
-        {
-            return Ok(());
+        match self {
+            Either::Left(b) => b.handle_subscribe(client_id, channel).await,
+            Either::Right(b) => b.handle_subscribe(client_id, channel).await,
         }
-
-        let inner_client_subscriptions = client_subscriptions.clone();
-        let inner_senders = senders.clone();
-        let inner_channel = channel.clone();
-
-        let subscription_join_handler = tokio::spawn(async move {
-            // TODO handle error
-            // Serve loop
-            loop {
-                let mut msg_stream = pubsub.on_message();
-                if let Some(msg) = msg_stream.next().await {
-                    let payload: String = msg.get_payload()?;
-                    for client_id in inner_client_subscriptions
-                        .read()
-                        .unwrap()
-                        .get(&inner_channel)
-                        .unwrap_or(&HashSet::new())
-                    {
-                        if let Some(sender) = inner_senders.read().unwrap().get(client_id) {
-                            // TODO Stop cloning the payload
-                            // TODO maybe I can use `Cow<'static, &str>` instead
-                            sender.send(payload.clone()).unwrap();
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            // serve tear down
-            let mut client_subscriptions_guard = inner_client_subscriptions.write().unwrap();
-
-            // Remove current client from the channel
-            client_subscriptions_guard
-                .entry(inner_channel.clone())
-                .or_insert(HashSet::new())
-                .remove(&client_id);
-
-            // delete channel if empty
-            if let Some(clients) = client_subscriptions_guard.get(&inner_channel) {
-                if clients.is_empty() {
-                    client_subscriptions_guard.remove(&inner_channel);
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        });
-
-        self.subscription_join_handlers
-            .write()
-            .unwrap()
-            .insert(channel, subscription_join_handler);
-
-        Ok(())
     }
 
+    /// Handles [BrokerCommand::Unsubscribe] messages
     async fn handle_unsubscribe(&self, client_id: String, channel: String) -> Result<()> {
-        self.client_subscriptions
-            .write()
-            .unwrap()
-            .entry(channel.clone())
-            .or_insert(HashSet::new())
-            .remove(&client_id);
-        Ok(())
-    }
-
-    async fn serve_admin_commands(
-        redis_client: redis::Client,
-        api_tx: mpsc::UnboundedSender<BrokerMessage>,
-    ) -> Result<()> {
-        let conn = redis_client.get_tokio_connection().await?;
-        let mut pubsub = conn.into_pubsub();
-        pubsub.subscribe("admin").await?;
-        let mut msg_stream = pubsub.on_message();
-        while let Some(msg) = msg_stream.next().await {
-            let payload: String = msg.get_payload()?;
-            let mut iter = payload.split(':');
-            let command = iter.next().ok_or(anyhow::anyhow!("No command"))?;
-            match command {
-                "subscribe" => {
-                    let client_id = iter.next().ok_or(anyhow::anyhow!("No client_id"))?;
-                    let channel = iter.next().ok_or(anyhow::anyhow!("No channel name"))?;
-                    api_tx.send(BrokerMessage::Subscribe(
-                        client_id.to_string(),
-                        channel.to_string(),
-                    ))?;
-                }
-                "unsubscribe" => {
-                    let client_id = iter.next().ok_or(anyhow::anyhow!("No client_id"))?;
-                    let channel = iter.next().ok_or(anyhow::anyhow!("No channel name"))?;
-                    api_tx.send(BrokerMessage::Unsubscribe(
-                        client_id.to_string(),
-                        channel.to_string(),
-                    ))?;
-                }
-                _ => {}
-            }
+        match self {
+            Either::Left(b) => b.handle_unsubscribe(client_id, channel).await,
+            Either::Right(b) => b.handle_unsubscribe(client_id, channel).await,
         }
-        Ok(())
     }
 
-    pub async fn serve_broker_api(&mut self) -> Result<()> {
-        while let Some(broker_message) = self.api_rx.recv().await {
-            match broker_message {
-                BrokerMessage::ConnectClient(client_id, tx) => {
-                    self.handle_connect_client(client_id, tx).await?;
-                }
-                BrokerMessage::DisconnectClient(client_id) => {
-                    self.handle_disconnect_client(client_id).await?;
-                }
-                BrokerMessage::Subscribe(client_id, channel) => {
-                    self.handle_subscribe(client_id, channel).await?;
-                }
-                BrokerMessage::Unsubscribe(client_id, channel) => {
-                    self.handle_unsubscribe(client_id, channel).await?;
-                }
-            };
-        }
-        Ok(())
-    }
-
-    /// TODO
-    pub async fn run(&mut self) -> Result<()> {
-        let redis_client = self.redis_client.clone();
-        let api_tx = self.api_tx.clone();
-        let admin_commands = Self::serve_admin_commands(redis_client, api_tx);
-        let broker_api = self.serve_broker_api();
-        tokio::select! {
-            r = admin_commands => { r}
-            r = broker_api => {r}
-        }?;
-        Ok(())
-    }
-}
-
-/// Decouple RedisBroker's controls from the actual broker
-///
-/// This is useful to avoid ownership issues when using the broker in a web server
-#[derive(Clone)]
-pub struct BrokerApi {
-    pub broker_tx: mpsc::UnboundedSender<BrokerMessage>,
-}
-
-impl BrokerApi {
-    pub fn new(broker_tx: mpsc::UnboundedSender<BrokerMessage>) -> Self {
-        Self { broker_tx }
-    }
-
-    pub async fn connect_client(&self, client_id: String) -> Result<broadcast::Sender<String>> {
-        let (tx, rx) = oneshot::channel();
-        self.broker_tx
-            .send(BrokerMessage::ConnectClient(client_id, tx))?;
-        let broadcast_rx = rx.await?;
-        Ok(broadcast_rx)
-    }
-
-    pub async fn disconnect_client(&self, client_id: String) -> Result<()> {
-        self.broker_tx
-            .send(BrokerMessage::DisconnectClient(client_id))?;
-        Ok(())
-    }
-
-    /// TODO
-    pub async fn subscribe(&self, client_id: String, channel: String) -> Result<()> {
-        let msg = BrokerMessage::Subscribe(client_id, channel);
-        self.broker_tx.send(msg)?;
-        Ok(())
-    }
-
-    pub async fn unsubscribe(&self, client_id: String, channel: String) -> Result<()> {
-        let msg = BrokerMessage::Unsubscribe(client_id, channel);
-        self.broker_tx.send(msg)?;
-        Ok(())
+    fn run_backend_server<'broker, 'fut>(
+        &'broker self,
+    ) -> impl Future<Output = Result<()>> + Send + 'fut
+    where
+        'fut: 'broker,
+    {
+        let fut = match self {
+            Either::Left(b) => Either::Left(b.run_backend_server()),
+            Either::Right(b) => Either::Right(b.run_backend_server()),
+        };
+        fut
     }
 }
